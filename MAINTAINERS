@@ -2141,6 +2141,21 @@ F: net/can/*
 F: hw/net/can/*
 F: include/net/can_*.h
 
+Battery
+M: Leonid Bloch <lb.workbox@gmail.com>
+S: Maintained
+F: hw/acpi/battery.*
+
+AC Adapter
+M: Leonid Bloch <lb.workbox@gmail.com>
+S: Maintained
+F: hw/acpi/acad.*
+
+Button
+M: Leonid Bloch <lb.workbox@gmail.com>
+S: Maintained
+F: hw/acpi/button.*
+
 Subsystems
 ----------
 Audio

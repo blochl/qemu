@@ -41,4 +41,16 @@ config ACPI_VMGENID
     default y
     depends on PC
 
+config BATTERY
+    bool
+    depends on ACPI
+
+config AC_ADAPTER
+    bool
+    depends on ACPI
+
+config BUTTON
+    bool
+    depends on ACPI
+
 config ACPI_HW_REDUCED
