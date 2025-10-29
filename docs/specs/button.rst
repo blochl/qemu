@@ -4,82 +4,20 @@
 Laptop Lid Button Device
 ========================
 
-The button device provides laptop lid button state information to the guest.
-It supports two operating modes:
-
-1. **QMP Control Mode** (default): Lid state is controlled via QMP commands,
-   providing deterministic control for testing and migration safety.
-2. **Procfs Mode**: Lid state mirrors the host's physical lid button, useful
-   for desktop virtualization where the guest should see the host's lid state.
+The button device provides laptop lid button state information to the guest via
+ACPI. Lid state is controlled via QMP commands, providing deterministic control
+for testing and migration safety.
 
 Configuration
 -------------
 
 The lid button device is created as an ISA device using ``-device button``.
 
-Operating Modes
-~~~~~~~~~~~~~~~
-
-**QMP Control Mode** (``use-qmp=true``, default)
-  Lid state is controlled via QMP commands. This mode is recommended for:
-
-  * Production environments requiring migration support
-  * Testing with predictable lid states
-  * Environments without host lid button access
-  * Security-sensitive deployments
-
-**Procfs Mode** (``enable-procfs=true``)
-  Lid mirrors the host's physical lid button. This mode is useful for:
-
-  * Desktop virtualization on laptops
-  * Development and testing with real lid button behavior
-
-  Note: Procfs mode reads host files and runs timers, which may impact
-  security and migration. Use with caution in production.
-
 Properties
 ~~~~~~~~~~
 
 ``ioport`` (default: 0x53d)
   I/O port base address for the lid button device register.
-
-``use-qmp`` (default: true)
-  Enable QMP control mode. When true, lid state is controlled via
-  QMP commands. Cannot be used together with ``enable-procfs=true``.
-
-``enable-procfs`` (default: false)
-  Enable procfs mode to mirror the host's lid button. Cannot be used together
-  with ``use-qmp=true``.
-
-``probe_interval`` (default: 2000)
-  Time interval between periodic probes in milliseconds (procfs mode only).
-  The minimum allowed value is 10ms to prevent excessive polling.
-
-``procfs_path`` (default: /proc/acpi/button)
-  Path to the host's lid button procfs directory (procfs mode only). The device
-  will automatically scan this directory to find the lid state file. Use this
-  property to specify a different path or to provide a custom location for
-  testing purposes.
-
-Host Lid Button Detection
--------------------------
-
-The host's lid button information is taken from::
-
-    /proc/acpi/button/lid/*/state
-
-This file is expected to be formatted as:
-
-- ``state:      open`` (if the lid is open)
-- ``state:      closed`` (if the lid is closed)
-
-These formats are based on the Linux 'button' driver.
-
-The device automatically scans the ``/proc/acpi/button/lid/`` directory
-for subdirectories containing a readable ``state`` file. If the procfs path
-differs, a different lid button needs to be probed, or even if a "fake" host
-lid button is to be provided, the ``procfs_path`` property allows overriding
-the default detection.
 
 ACPI Interface
 --------------
@@ -119,7 +57,7 @@ Register Layout
 QMP Commands
 ------------
 
-When using QMP control mode (default), the following commands are available:
+The following QMP commands control the lid button state:
 
 ``lid-button-set-state``
   Set the lid button state.
@@ -143,9 +81,9 @@ When using QMP control mode (default), the following commands are available:
 Examples
 --------
 
-QMP control mode (default - recommended)::
+Basic usage::
 
-  # Start with QMP control
+  # Start VM with lid button
   qemu-system-x86_64 -device button -qmp tcp:localhost:4444,server,wait=off
 
   # From another terminal, set lid state via QMP:
@@ -154,36 +92,40 @@ QMP control mode (default - recommended)::
          "arguments":{"open":false}}' | \
   nc -N localhost 4444
 
-Procfs mode (mirror host lid button)::
+Simulate closing lid::
 
-  # Enable procfs mode to mirror host lid button
-  qemu-system-x86_64 -device button,use-qmp=false,enable-procfs=true
+  # Start with lid open (default)
+  # Close the lid
+  echo '{"execute":"lid-button-set-state",
+         "arguments":{"open":false}}' | nc -N localhost 4444
 
-  # Custom probe interval (5 seconds)
-  qemu-system-x86_64 -device button,use-qmp=false,enable-procfs=true,probe_interval=5000
+  # Later, open the lid
+  echo '{"execute":"lid-button-set-state",
+         "arguments":{"open":true}}' | nc -N localhost 4444
 
-  # Custom procfs path
-  qemu-system-x86_64 -device button,use-qmp=false,enable-procfs=true,procfs_path=/custom/path
+Test suspend on lid close::
 
-Testing with fake lid button::
+  # Start VM with ACPI support
+  qemu-system-x86_64 -device button
 
-  # Create fake lid button files for testing
-  mkdir -p /tmp/fake_lid/lid/LID0
-  echo "state:      open" > /tmp/fake_lid/lid/LID0/state    # Format: "state:      open" or "state:      closed"
+  # Close lid - guest OS should detect this and may suspend
+  echo '{"execute":"lid-button-set-state",
+         "arguments":{"open":false}}' | nc -N localhost 4444
 
-  # Use fake lid button in procfs mode
-  qemu-system-x86_64 -device button,use-qmp=false,enable-procfs=true,procfs_path=/tmp/fake_lid
-
-  # Update lid state while VM is running (from another terminal)
-  echo "state:      closed" > /tmp/fake_lid/lid/LID0/state  # Close lid
-  echo "state:      open" > /tmp/fake_lid/lid/LID0/state    # Open lid
+  # Open lid - guest OS should wake or detect lid open
+  echo '{"execute":"lid-button-set-state",
+         "arguments":{"open":true}}' | nc -N localhost 4444
 
 Combined with other laptop devices::
 
-  # QMP mode (recommended)
+  # Create a complete laptop environment
   qemu-system-x86_64 -device battery -device acad -device button
 
-  # Procfs/sysfs mode (desktop virtualization)
-  qemu-system-x86_64 -device battery,use-qmp=false,enable-sysfs=true \
-                     -device acad,use-qmp=false,enable-sysfs=true \
-                     -device button,use-qmp=false,enable-procfs=true
+  # Simulate closing lid while on battery power
+  echo '{"execute":"battery-set-state",
+         "arguments":{"state":{"present":true,"charging":false,
+                               "discharging":true,"charge-percent":60}}}
+        {"execute":"ac-adapter-set-state",
+         "arguments":{"connected":false}}
+        {"execute":"lid-button-set-state",
+         "arguments":{"open":false}}' | nc -N localhost 4444
