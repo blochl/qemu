@@ -17,8 +17,6 @@
 
 #define TYPE_AC_ADAPTER                  "acad"
 #define AC_ADAPTER_IOPORT_PROP           "ioport"
-#define AC_ADAPTER_PATH_PROP             "sysfs_path"
-#define AC_ADAPTER_PROBE_STATE_INTERVAL  "probe_interval"
 
 #define AC_ADAPTER_VAL_UNKNOWN  0xFFFFFFFF
 

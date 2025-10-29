@@ -31,10 +31,6 @@
 
 #define AC_STA_ADDR               0
 
-#define SYSFS_PATH                "/sys/class/power_supply"
-#define AC_ADAPTER_TYPE           "Mains"
-#define MAX_ALLOWED_TYPE_LENGTH   16
-
 enum {
     AC_ADAPTER_OFFLINE = 0,
     AC_ADAPTER_ONLINE = 1,
@@ -45,177 +41,14 @@ typedef struct ACADState {
     MemoryRegion io;
     uint16_t ioport;
     uint8_t state;
-    bool use_qmp_control;
     bool qmp_connected;
-    bool enable_sysfs;
-
-    QEMUTimer *probe_state_timer;
-    uint64_t probe_state_interval;
-
-    char *acad_path;
 } ACADState;
-
-static const char *online_file = "online";
-static const char *type_file = "type";
-
-static inline bool acad_file_accessible(char *path, const char *file)
-{
-    char full_path[PATH_MAX];
-    int path_len;
-
-    path_len = snprintf(full_path, PATH_MAX, "%s/%s", path, file);
-    if (path_len < 0 || path_len >= PATH_MAX) {
-        return false;
-    }
-
-    if (access(full_path, R_OK) == 0) {
-        return true;
-    }
-    return false;
-}
-
-static void acad_get_state(ACADState *s)
-{
-    char file_path[PATH_MAX];
-    int path_len;
-    uint8_t val;
-    FILE *ff;
-
-    path_len = snprintf(file_path, PATH_MAX, "%s/%s", s->acad_path,
-                        online_file);
-    if (path_len < 0 || path_len >= PATH_MAX) {
-        warn_report("Could not read the AC adapter state.");
-        return;
-    }
-
-    ff = fopen(file_path, "r");
-    if (ff == NULL) {
-        warn_report("Could not read the AC adapter state.");
-        return;
-    }
-
-    if (!fscanf(ff, "%hhu", &val)) {
-        warn_report("AC adapter state unreadable.");
-    } else {
-        switch (val) {
-        case AC_ADAPTER_OFFLINE:
-        case AC_ADAPTER_ONLINE:
-            s->state = val;
-            break;
-        default:
-            warn_report("AC adapter state undetermined.");
-        }
-    }
-    fclose(ff);
-}
 
 static void acad_get_dynamic_status(ACADState *s)
 {
-    if (s->use_qmp_control) {
-        s->state = s->qmp_connected ? AC_ADAPTER_ONLINE : AC_ADAPTER_OFFLINE;
-    } else if (s->enable_sysfs) {
-        acad_get_state(s);
-    } else {
-        s->state = AC_ADAPTER_OFFLINE;
-    }
+    s->state = s->qmp_connected ? AC_ADAPTER_ONLINE : AC_ADAPTER_OFFLINE;
 
     trace_acad_get_dynamic_status(s->state);
-}
-
-static void acad_probe_state(void *opaque)
-{
-    ACADState *s = opaque;
-
-    uint8_t state_before = s->state;
-
-    acad_get_dynamic_status(s);
-
-    if (state_before != s->state) {
-        Object *obj = object_resolve_path_type("", TYPE_ACPI_DEVICE_IF, NULL);
-        acpi_send_event(DEVICE(obj), ACPI_AC_ADAPTER_CHANGE_STATUS);
-    }
-    timer_mod(s->probe_state_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
-              s->probe_state_interval);
-}
-
-static void acad_probe_state_timer_init(ACADState *s)
-{
-    if (s->enable_sysfs && s->probe_state_interval > 0) {
-        s->probe_state_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
-                                            acad_probe_state, s);
-        timer_mod(s->probe_state_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
-                  s->probe_state_interval);
-    }
-}
-
-static bool acad_verify_sysfs(ACADState *s, char *path)
-{
-    FILE *ff;
-    char type_path[PATH_MAX];
-    int path_len;
-    char val[MAX_ALLOWED_TYPE_LENGTH];
-
-    path_len = snprintf(type_path, PATH_MAX, "%s/%s", path, type_file);
-    if (path_len < 0 || path_len >= PATH_MAX) {
-        return false;
-    }
-
-    ff = fopen(type_path, "r");
-    if (ff == NULL) {
-        return false;
-    }
-
-    if (fgets(val, MAX_ALLOWED_TYPE_LENGTH, ff) == NULL) {
-        fclose(ff);
-        return false;
-    } else {
-        val[strcspn(val, "\n")] = 0;
-        if (strncmp(val, AC_ADAPTER_TYPE, MAX_ALLOWED_TYPE_LENGTH)) {
-            fclose(ff);
-            return false;
-        }
-    }
-    fclose(ff);
-
-    return acad_file_accessible(path, online_file);
-}
-
-static bool get_acad_path(DeviceState *dev)
-{
-    ACADState *s = AC_ADAPTER_DEVICE(dev);
-    DIR *dir;
-    struct dirent *ent;
-    char bp[PATH_MAX];
-    int path_len;
-
-    if (s->acad_path) {
-        return acad_verify_sysfs(s, s->acad_path);
-    }
-
-    dir = opendir(SYSFS_PATH);
-    if (dir == NULL) {
-        return false;
-    }
-
-    ent = readdir(dir);
-    while (ent != NULL) {
-        if (ent->d_name[0] != '.') {
-            path_len = snprintf(bp, PATH_MAX, "%s/%s", SYSFS_PATH,
-                                ent->d_name);
-            if (path_len < 0 || path_len >= PATH_MAX) {
-                return false;
-            }
-            if (acad_verify_sysfs(s, bp)) {
-                qdev_prop_set_string(dev, AC_ADAPTER_PATH_PROP, bp);
-                closedir(dir);
-                return true;
-            }
-        }
-        ent = readdir(dir);
-    }
-    closedir(dir);
-
-    return false;
 }
 
 static void acad_realize(DeviceState *dev, Error **errp)
@@ -224,30 +57,13 @@ static void acad_realize(DeviceState *dev, Error **errp)
     ACADState *s = AC_ADAPTER_DEVICE(dev);
     FWCfgState *fw_cfg = fw_cfg_find();
     uint16_t *acad_port;
-    char err_details[32] = {};
 
     trace_acad_realize();
 
-    if (s->use_qmp_control && s->enable_sysfs) {
-        error_setg(errp, "Cannot enable both QMP control and sysfs mode");
-        return;
-    }
-
-    if (s->enable_sysfs) {
-        if (!s->acad_path) {
-            strcpy(err_details, " Try using 'sysfs_path='");
-        }
-
-        if (!get_acad_path(dev)) {
-            error_setg(errp, "AC adapter sysfs path not found or unreadable.%s",
-                       err_details);
-            return;
-        }
-    }
+    /* Initialize to disconnected by default */
+    s->qmp_connected = false;
 
     isa_register_ioport(d, &s->io, s->ioport);
-
-    acad_probe_state_timer_init(s);
 
     if (!fw_cfg) {
         return;
@@ -261,11 +77,6 @@ static void acad_realize(DeviceState *dev, Error **errp)
 
 static const Property acad_device_properties[] = {
     DEFINE_PROP_UINT16(AC_ADAPTER_IOPORT_PROP, ACADState, ioport, 0x53c),
-    DEFINE_PROP_BOOL("use-qmp", ACADState, use_qmp_control, true),
-    DEFINE_PROP_BOOL("enable-sysfs", ACADState, enable_sysfs, false),
-    DEFINE_PROP_UINT64(AC_ADAPTER_PROBE_STATE_INTERVAL, ACADState,
-                       probe_state_interval, 2000),
-    DEFINE_PROP_STRING(AC_ADAPTER_PATH_PROP, ACADState, acad_path),
 };
 
 static const VMStateDescription acad_vmstate = {
@@ -274,7 +85,6 @@ static const VMStateDescription acad_vmstate = {
     .minimum_version_id = 1,
     .fields = (VMStateField[]) {
         VMSTATE_UINT16(ioport, ACADState),
-        VMSTATE_UINT64(probe_state_interval, ACADState),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -428,13 +238,7 @@ AcAdapterInfo *qmp_query_ac_adapter(Error **errp)
     }
 
     ret = g_new0(AcAdapterInfo, 1);
-
-    if (s->use_qmp_control) {
-        ret->connected = s->qmp_connected;
-    } else {
-        acad_get_dynamic_status(s);
-        ret->connected = (s->state == AC_ADAPTER_ONLINE);
-    }
+    ret->connected = s->qmp_connected;
 
     return ret;
 }
