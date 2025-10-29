@@ -32,15 +32,6 @@
 #define BATTERY_CHARGING     0x02  /* ACPI _BST bit 1 */
 #define BATTERY_CRITICAL     0x04  /* ACPI _BST bit 2 */
 
-#define SYSFS_PATH       "/sys/class/power_supply"
-#define BATTERY_TYPE     "Battery"
-
-#define MAX_ALLOWED_STATE_LENGTH  32  /* For convinience when comparing */
-
-#define NORMALIZE_BY_FULL(val, full) \
-    ((full == 0) ? BATTERY_VAL_UNKNOWN \
-     : (uint32_t)(val * BATTERY_FULL_CAP / full))
-
 typedef union bat_metric {
     uint32_t val;
     uint8_t acc[4];
@@ -53,20 +44,11 @@ typedef struct BatteryState {
     bat_metric state;
     bat_metric rate;
     bat_metric charge;
-    uint32_t charge_full;
-    int units;  /* 0 - mWh, 1 - mAh */
-    bool use_qmp_control;
     bool qmp_present;
     bool qmp_charging;
     bool qmp_discharging;
     int qmp_charge_percent;
     int qmp_rate;
-    bool enable_sysfs;
-
-    QEMUTimer *probe_state_timer;
-    uint64_t probe_state_interval;
-
-    char *bat_path;
 } BatteryState;
 
 /* Access addresses */
@@ -76,334 +58,21 @@ enum acc_addr {
     bcrg_addr0, bcrg_addr1, bcrg_addr2, bcrg_addr3
 };
 
-/* Files used when the units are:      mWh             mAh      */
-static const char *full_file[] = { "energy_full", "charge_full" };
-static const char *now_file[]  = { "energy_now",  "charge_now"  };
-static const char *rate_file[] = { "power_now",   "current_now" };
-
-static const char *stat_file = "status";
-static const char *type_file = "type";
-
-static const char *discharging_states[] = { "Discharging", "Not charging" };
-static const char *charging_states[] = { "Charging", "Full", "Unknown" };
-
-static inline bool battery_file_accessible(char *path, const char *file)
-{
-    char full_path[PATH_MAX];
-    int path_len;
-
-    path_len = snprintf(full_path, PATH_MAX, "%s/%s", path, file);
-    if (path_len < 0 || path_len >= PATH_MAX) {
-        return false;
-    }
-    if (access(full_path, R_OK) == 0) {
-        return true;
-    }
-    return false;
-}
-
-static inline int battery_select_file(char *path, const char **file)
-{
-    if (battery_file_accessible(path, file[0])) {
-        return 0;
-    } else if (battery_file_accessible(path, file[1])) {
-        return 1;
-    } else {
-        return -1;
-    }
-}
-
-static void battery_get_full_charge(BatteryState *s, Error **errp)
-{
-    char file_path[PATH_MAX];
-    int path_len;
-    uint32_t val;
-    FILE *ff;
-
-    path_len = snprintf(file_path, PATH_MAX, "%s/%s", s->bat_path,
-                        full_file[s->units]);
-    if (path_len < 0 || path_len >= PATH_MAX) {
-        error_setg(errp, "Full capacity file path is inaccessible.");
-        return;
-    }
-
-    ff = fopen(file_path, "r");
-    if (ff == NULL) {
-        error_setg_errno(errp, errno, "Could not read the full charge file.");
-        return;
-    }
-
-    if (fscanf(ff, "%u", &val) != 1) {
-        error_setg(errp, "Full capacity undetermined.");
-        return;
-    } else {
-        s->charge_full = val;
-    }
-    fclose(ff);
-}
-
-static inline bool battery_is_discharging(char *val)
-{
-    static const int discharging_len = ARRAY_SIZE(discharging_states);
-    int i;
-
-    for (i = 0; i < discharging_len; i++) {
-        if (!strncmp(val, discharging_states[i], MAX_ALLOWED_STATE_LENGTH)) {
-            return true;
-        }
-    }
-    return false;
-}
-
-static inline bool battery_is_charging(char *val)
-{
-    static const int charging_len = ARRAY_SIZE(charging_states);
-    int i;
-
-    for (i = 0; i < charging_len; i++) {
-        if (!strncmp(val, charging_states[i], MAX_ALLOWED_STATE_LENGTH)) {
-            return true;
-        }
-    }
-    return false;
-}
-
-static void battery_get_state(BatteryState *s)
-{
-    char file_path[PATH_MAX];
-    int path_len;
-    char val[MAX_ALLOWED_STATE_LENGTH];
-    FILE *ff;
-
-    path_len = snprintf(file_path, PATH_MAX, "%s/%s", s->bat_path, stat_file);
-    if (path_len < 0 || path_len >= PATH_MAX) {
-        warn_report("Could not read the battery state.");
-        return;
-    }
-
-    ff = fopen(file_path, "r");
-    if (ff == NULL) {
-        warn_report("Could not read the battery state.");
-        return;
-    }
-
-    if (fgets(val, MAX_ALLOWED_STATE_LENGTH, ff) == NULL) {
-        warn_report("Battery state unreadable.");
-    } else {
-        val[strcspn(val, "\n")] = 0;
-        if (battery_is_discharging(val)) {
-            s->state.val = BATTERY_DISCHARGING;
-        } else if (battery_is_charging(val)) {
-            s->state.val = BATTERY_CHARGING;
-        } else {
-            s->state.val = 0;
-            warn_report("Battery state undetermined.");
-        }
-    }
-    fclose(ff);
-}
-
-static void battery_get_rate(BatteryState *s)
-{
-    char file_path[PATH_MAX];
-    int path_len;
-    uint64_t val;
-    FILE *ff;
-
-    path_len = snprintf(file_path, PATH_MAX, "%s/%s", s->bat_path,
-                        rate_file[s->units]);
-    if (path_len < 0 || path_len >= PATH_MAX) {
-        warn_report("Could not read the battery rate.");
-        s->rate.val = BATTERY_VAL_UNKNOWN;
-        return;
-    }
-
-    ff = fopen(file_path, "r");
-    if (ff == NULL) {
-        warn_report("Could not read the battery rate.");
-        s->rate.val = BATTERY_VAL_UNKNOWN;
-        return;
-    }
-
-    if (fscanf(ff, "%lu", &val) != 1) {
-        warn_report("Battery rate undetermined.");
-        s->rate.val = BATTERY_VAL_UNKNOWN;
-    } else {
-        s->rate.val = NORMALIZE_BY_FULL(val, s->charge_full);
-    }
-    fclose(ff);
-}
-
-static void battery_get_charge(BatteryState *s)
-{
-    char file_path[PATH_MAX];
-    int path_len;
-    uint64_t val;
-    FILE *ff;
-
-    path_len = snprintf(file_path, PATH_MAX, "%s/%s", s->bat_path,
-                        now_file[s->units]);
-    if (path_len < 0 || path_len >= PATH_MAX) {
-        warn_report("Could not read the battery charge.");
-        s->charge.val = BATTERY_VAL_UNKNOWN;
-        return;
-    }
-
-    ff = fopen(file_path, "r");
-    if (ff == NULL) {
-        warn_report("Could not read the battery charge.");
-        s->charge.val = BATTERY_VAL_UNKNOWN;
-        return;
-    }
-
-    if (fscanf(ff, "%lu", &val) != 1) {
-        warn_report("Battery charge undetermined.");
-        s->charge.val = BATTERY_VAL_UNKNOWN;
-    } else {
-        s->charge.val = NORMALIZE_BY_FULL(val, s->charge_full);
-    }
-    fclose(ff);
-}
-
 static void battery_get_dynamic_status(BatteryState *s)
 {
-    if (s->use_qmp_control) {
-        s->state.val = 0;
-        if (s->qmp_present) {
-            if (s->qmp_charging) {
-                s->state.val |= BATTERY_CHARGING;
-            }
-            if (s->qmp_discharging) {
-                s->state.val |= BATTERY_DISCHARGING;
-            }
+    s->state.val = 0;
+    if (s->qmp_present) {
+        if (s->qmp_charging) {
+            s->state.val |= BATTERY_CHARGING;
         }
-        s->rate.val = s->qmp_rate;
-        s->charge.val = (s->qmp_charge_percent * BATTERY_FULL_CAP) / 100;
-    } else if (s->enable_sysfs) {
-        battery_get_state(s);
-        battery_get_rate(s);
-        battery_get_charge(s);
-    } else {
-        s->state.val = 0;
-        s->rate.val = 0;
-        s->charge.val = 0;
+        if (s->qmp_discharging) {
+            s->state.val |= BATTERY_DISCHARGING;
+        }
     }
+    s->rate.val = s->qmp_rate;
+    s->charge.val = (s->qmp_charge_percent * BATTERY_FULL_CAP) / 100;
 
     trace_battery_get_dynamic_status(s->state.val, s->rate.val, s->charge.val);
-}
-
-static void battery_probe_state(void *opaque)
-{
-    BatteryState *s = opaque;
-
-    uint32_t state_before = s->state.val;
-    uint32_t rate_before = s->rate.val;
-    uint32_t charge_before = s->charge.val;
-
-    battery_get_dynamic_status(s);
-
-    if (state_before != s->state.val || rate_before != s->rate.val ||
-        charge_before != s->charge.val) {
-        Object *obj = object_resolve_path_type("", TYPE_ACPI_DEVICE_IF, NULL);
-        switch (charge_before) {
-        case 0:
-            break;  /* Avoid marking initiation as an update */
-        default:
-            acpi_send_event(DEVICE(obj), ACPI_BATTERY_CHANGE_STATUS);
-        }
-    }
-    timer_mod(s->probe_state_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
-              s->probe_state_interval);
-}
-
-static void battery_probe_state_timer_init(BatteryState *s)
-{
-    if (s->enable_sysfs && s->probe_state_interval > 0) {
-        s->probe_state_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
-                                            battery_probe_state, s);
-        timer_mod(s->probe_state_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
-                  s->probe_state_interval);
-    }
-}
-
-static bool battery_verify_sysfs(BatteryState *s, char *path)
-{
-    int units;
-    FILE *ff;
-    char type_path[PATH_MAX];
-    int path_len;
-    char val[MAX_ALLOWED_STATE_LENGTH];
-
-    path_len = snprintf(type_path, PATH_MAX, "%s/%s", path, type_file);
-    if (path_len < 0 || path_len >= PATH_MAX) {
-        return false;
-    }
-    ff = fopen(type_path, "r");
-    if (ff == NULL) {
-        return false;
-    }
-
-    if (fgets(val, MAX_ALLOWED_STATE_LENGTH, ff) == NULL) {
-        fclose(ff);
-        return false;
-    } else {
-        val[strcspn(val, "\n")] = 0;
-        if (strncmp(val, BATTERY_TYPE, MAX_ALLOWED_STATE_LENGTH)) {
-            fclose(ff);
-            return false;
-        }
-    }
-    fclose(ff);
-
-    units = battery_select_file(path, full_file);
-
-    if (units < 0) {
-        return false;
-    } else {
-        s->units = units;
-    }
-
-    return (battery_file_accessible(path, now_file[s->units])
-            & battery_file_accessible(path, rate_file[s->units])
-            & battery_file_accessible(path, stat_file));
-}
-
-static bool get_battery_path(DeviceState *dev)
-{
-    BatteryState *s = BATTERY_DEVICE(dev);
-    DIR *dir;
-    struct dirent *ent;
-    char bp[PATH_MAX];
-    int path_len;
-
-    if (s->bat_path) {
-        return battery_verify_sysfs(s, s->bat_path);
-    }
-
-    dir = opendir(SYSFS_PATH);
-    if (dir == NULL) {
-        return false;
-    }
-
-    ent = readdir(dir);
-    while (ent != NULL) {
-        if (ent->d_name[0] != '.') {
-            path_len = snprintf(bp, PATH_MAX, "%s/%s", SYSFS_PATH,
-                                ent->d_name);
-            if (path_len < 0 || path_len >= PATH_MAX) {
-                return false;
-            }
-            if (battery_verify_sysfs(s, bp)) {
-                qdev_prop_set_string(dev, BATTERY_PATH_PROP, bp);
-                closedir(dir);
-                return true;
-            }
-        }
-        ent = readdir(dir);
-    }
-    closedir(dir);
-
-    return false;
 }
 
 static void battery_realize(DeviceState *dev, Error **errp)
@@ -412,42 +81,17 @@ static void battery_realize(DeviceState *dev, Error **errp)
     BatteryState *s = BATTERY_DEVICE(dev);
     FWCfgState *fw_cfg = fw_cfg_find();
     uint16_t *battery_port;
-    char err_details[0x20] = {};
 
     trace_battery_realize();
 
-    if (s->use_qmp_control && s->enable_sysfs) {
-        error_setg(errp, "Cannot enable both QMP control and sysfs mode");
-        return;
-    }
-
-    /* Initialize QMP state to sensible defaults when in QMP mode */
-    if (s->use_qmp_control) {
-        s->qmp_present = true;
-        s->qmp_charging = false;
-        s->qmp_discharging = true;
-        s->qmp_charge_percent = 50;
-        s->qmp_rate = 1000;  /* 1000 mW discharge rate */
-    }
-
-    if (s->enable_sysfs) {
-        if (!s->bat_path) {
-            strcpy(err_details, " Try using 'sysfs_path='");
-        }
-
-        if (!get_battery_path(dev)) {
-            error_setg(errp, "Battery sysfs path not found or unreadable.%s",
-                       err_details);
-            return;
-        }
-        battery_get_full_charge(s, errp);
-    } else {
-        s->charge_full = BATTERY_FULL_CAP;
-    }
+    /* Initialize QMP state to sensible defaults */
+    s->qmp_present = true;
+    s->qmp_charging = false;
+    s->qmp_discharging = true;
+    s->qmp_charge_percent = 50;
+    s->qmp_rate = 1000;  /* 1000 mW discharge rate */
 
     isa_register_ioport(d, &s->io, s->ioport);
-
-    battery_probe_state_timer_init(s);
 
     if (!fw_cfg) {
         return;
@@ -461,11 +105,6 @@ static void battery_realize(DeviceState *dev, Error **errp)
 
 static const Property battery_device_properties[] = {
     DEFINE_PROP_UINT16(BATTERY_IOPORT_PROP, BatteryState, ioport, 0x530),
-    DEFINE_PROP_BOOL("use-qmp", BatteryState, use_qmp_control, true),
-    DEFINE_PROP_BOOL("enable-sysfs", BatteryState, enable_sysfs, false),
-    DEFINE_PROP_UINT64(BATTERY_PROBE_STATE_INTERVAL, BatteryState,
-                       probe_state_interval, 2000),
-    DEFINE_PROP_STRING(BATTERY_PATH_PROP, BatteryState, bat_path),
 };
 
 static const VMStateDescription battery_vmstate = {
@@ -474,7 +113,6 @@ static const VMStateDescription battery_vmstate = {
     .minimum_version_id = 1,
     .fields = (VMStateField[]) {
         VMSTATE_UINT16(ioport, BatteryState),
-        VMSTATE_UINT64(probe_state_interval, BatteryState),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -703,22 +341,12 @@ BatteryInfo *qmp_query_battery(Error **errp)
 
     ret = g_new0(BatteryInfo, 1);
 
-    if (s->use_qmp_control) {
-        ret->present = s->qmp_present;
-        ret->charging = s->qmp_charging;
-        ret->discharging = s->qmp_discharging;
-        ret->charge_percent = s->qmp_charge_percent;
-        ret->has_rate = true;
-        ret->rate = s->qmp_rate;
-    } else {
-        battery_get_dynamic_status(s);
-        ret->present = true;
-        ret->charging = !!(s->state.val & BATTERY_CHARGING);
-        ret->discharging = !!(s->state.val & BATTERY_DISCHARGING);
-        ret->charge_percent = (s->charge.val * 100) / BATTERY_FULL_CAP;
-        ret->has_rate = true;
-        ret->rate = s->rate.val;
-    }
+    ret->present = s->qmp_present;
+    ret->charging = s->qmp_charging;
+    ret->discharging = s->qmp_discharging;
+    ret->charge_percent = s->qmp_charge_percent;
+    ret->has_rate = true;
+    ret->rate = s->qmp_rate;
 
     ret->has_remaining_capacity = false;
     ret->has_design_capacity = true;

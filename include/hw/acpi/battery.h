@@ -17,8 +17,6 @@
 
 #define TYPE_BATTERY                  "battery"
 #define BATTERY_IOPORT_PROP           "ioport"
-#define BATTERY_PATH_PROP             "sysfs_path"
-#define BATTERY_PROBE_STATE_INTERVAL  "probe_interval"
 
 #define BATTERY_FULL_CAP     10000  /* mWh */
 
