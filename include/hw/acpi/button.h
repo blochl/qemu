@@ -17,8 +17,6 @@
 
 #define TYPE_BUTTON                  "button"
 #define BUTTON_IOPORT_PROP           "ioport"
-#define BUTTON_PATH_PROP             "procfs_path"
-#define BUTTON_PROBE_STATE_INTERVAL  "probe_interval"
 
 #define BUTTON_LEN                   1
 
